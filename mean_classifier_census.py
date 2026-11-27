@@ -1,129 +1,172 @@
 # %%
+import numpy as np
+import pandas as pd
 import torch
-import pytorch_optimizer as optimizers
-from river import linear_model, optim, stream
-from adult import Adult
-from sklearn.preprocessing import RobustScaler
-import mc
+import torch.nn.functional as F
+from sklearn.datasets import fetch_openml
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, normalize
+from torch import nn
 
 # %%
-# Cost parameter
-c = 1.0  # Cost parameter for false positives
+SEED = 42
+C = 1.0  # Cost parameter for false positives
+STEPS = 5000
+TEST_SIZE = 16281  # Size of the standard UCI Adult test split
 
-
-# %%
-# Define loss function
-def loss(y_true, y_pred, c=1):
-    # y_true, y_pred: 1D tensors with values in {-1, 1}
-    yt = y_true.view(-1)
-    yp = y_pred.view(-1)
-    false_neg = ((yt == 1) & (yp == -1)).sum().item() * 1
-    false_pos = ((yt == -1) & (yp == 1)).sum().item() * c
-    total = yt.numel()
-    return (false_neg + false_pos) / total
+torch.manual_seed(SEED)
+torch.set_float32_matmul_precision("high")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # %%
-# Load in Data
-train_set = Adult(root=".\\data", download=True)
-test_set = Adult(root=".\\data", download=True, train=False)
+def loss(y_true, y_pred, c=1.0):
+    """Cost-weighted error rate for labels in {-1, 1}."""
+    false_neg = ((y_true == 1) & (y_pred == -1)).sum()
+    false_pos = ((y_true == -1) & (y_pred == 1)).sum()
+    return ((false_neg + c * false_pos) / y_true.numel()).item()
 
-fm = RobustScaler()
-train_set.data = torch.tensor(fm.fit_transform(train_set.data), dtype=torch.float32)
-test_set.data = torch.tensor(fm.transform(test_set.data), dtype=torch.float32)
 
-train_set.targets = torch.where(train_set.targets == 1, -1, 1)
-test_set.targets = torch.where(test_set.targets == 1, -1, 1)
+def load_adult():
+    """Adult census data from OpenML (cached by sklearn after the first download)."""
+    X, income = fetch_openml("adult", version=2, as_frame=True, return_X_y=True)
+    # One-hot encode; binary `sex` becomes one column. Missing values are all zeros.
+    X = pd.get_dummies(X, columns=["sex"], drop_first=True, dtype=np.float32)
+    X = pd.get_dummies(X, dtype=np.float32).to_numpy(np.float32)
+    y = np.where(income == ">50K", -1.0, 1.0).astype(np.float32)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, stratify=y, random_state=SEED
+    )
+    scaler = StandardScaler()
+    X_train = normalize(scaler.fit_transform(X_train))  # unit L2 norm per row
+    X_test = normalize(scaler.transform(X_test))
+    return X_train, X_test, y_train, y_test
+
 
 # %%
-# Baseline Constant Classifier
-constant_predictions_neg = torch.full_like(test_set.targets, -1)
-constant_predictions_pos = torch.full_like(test_set.targets, 1)
-print(
-    "Constant Classifier Loss:",
-    min(
-        loss(test_set.targets, constant_predictions_neg, c=c),
-        loss(test_set.targets, constant_predictions_pos, c=c),
-    ),
+def learn_mean_weights(X, y, c=1.0):
+    """Mean of the label-weighted feature vectors; negatives are weighted by c."""
+    weights = y if c == 1.0 else torch.where(y == -1, -c, 1.0)
+    return (X * weights.unsqueeze(1)).mean(0)
+
+
+def mean_classifier(X, mean_weights):
+    return torch.sign(X @ mean_weights).to(torch.int64)
+
+
+def self_similarity_loss_linear(x, labels, c=1.0):
+    # sum_ij w_i w_j <x_i, x_j> = ||sum_i w_i x_i||^2, avoiding the N x N matrix
+    weights = labels if c == 1.0 else torch.where(labels == -1, -c, 1.0)
+    return (weights @ x).square().sum()
+
+
+class ResNN(nn.Module):
+    """Residual block, initialised to the identity map."""
+
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.linear_stack = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
+        self.final_layer = nn.Linear(hidden_dim, input_dim)
+
+    def initialize(self):
+        hidden = self.linear_stack[0]
+        nn.init.kaiming_normal_(hidden.weight, mode="fan_out", nonlinearity="relu")
+        nn.init.zeros_(hidden.bias)
+        nn.init.zeros_(self.final_layer.weight)
+        nn.init.zeros_(self.final_layer.bias)
+
+    def forward(self, x):
+        return x + self.final_layer(self.linear_stack(x))
+
+
+class NormalizedStackedResNN(nn.Module):
+    """Stack of residual blocks with unit L2 norm outputs."""
+
+    def __init__(self, n_nets, input_dim, hidden_dim):
+        super().__init__()
+        self.nets = nn.Sequential(
+            *[ResNN(input_dim, hidden_dim) for _ in range(n_nets)]
+        )
+        # Initialise after building all blocks, so seeded runs match the old mc.py
+        for net in self.nets:
+            net.initialize()
+
+    def forward(self, x):
+        return F.normalize(self.nets(x), p=2, dim=1)
+
+
+# %%
+# Load data
+X_train_np, X_test_np, y_train_np, y_test_np = load_adult()
+
+X_train = torch.as_tensor(X_train_np, dtype=torch.float32, device=device)
+X_test = torch.as_tensor(X_test_np, dtype=torch.float32, device=device)
+y_train = torch.as_tensor(y_train_np, device=device)
+y_test = torch.as_tensor(y_test_np, device=device)
+n_features = X_train.shape[1]
+
+# %%
+# Baseline constant classifier
+constant_loss = min(
+    loss(y_test, torch.full_like(y_test, label), c=C) for label in (-1, 1)
+)
+print("Constant Classifier Loss:", constant_loss)
+
+# %%
+# Mean classifier
+mean_weights = learn_mean_weights(X_train, y_train, c=C)
+print("Mean Loss:", loss(y_test, mean_classifier(X_test, mean_weights), c=C))
+
+# %%
+# Logistic regression baseline (L2 penalty, C=1)
+# liblinear solver
+log_reg = LogisticRegression(solver="liblinear", max_iter=10000)
+log_reg.fit(X_train_np, y_train_np)
+prob_pos = log_reg.predict_proba(X_test_np)[:, 1]  # P(y = +1)
+predictions = torch.as_tensor(np.where(prob_pos >= C / (1 + C), 1, -1), device=device)
+print("Logistic Regression Loss:", loss(y_test, predictions, c=C))
+
+# %%
+# Neural network feature map
+my_nn = NormalizedStackedResNN(2, n_features, 200).to(device)
+
+opt = torch.optim.Adam(
+    my_nn.parameters(), lr=0.001, maximize=True, fused=device.type == "cuda"
 )
 
-# %%
-## Mean Classifier
-mean_weights = mc.learn_mean_weights(train_set.data, train_set.targets, c=c)
-predictions = mc.mean_classifier(test_set.data, mean_weights)
 
-print(
-    "Mean Loss:",
-    loss(test_set.targets, predictions, c=c),
-)
-
-# %%
-# Logistic Regression Baseline
-opt = optim.Averager(optim.AdaGrad(1.0), 0)
-log_reg = linear_model.LogisticRegression(optimizer=opt, loss=optim.losses.Log())
-for x, y in stream.iter_array(train_set.data.numpy(), train_set.targets.numpy()):
-    log_reg.learn_one(x, y)
-
-log_reg_avg = linear_model.LogisticRegression(optimizer=optim.SGD(2.0))
-log_reg_avg.learn_one(dict(opt.avg_w), 1)
-
-predictions = []
-for x, _ in stream.iter_array(test_set.data.numpy(), test_set.targets.numpy()):
-    predictions.append(log_reg_avg.predict_proba_one(x))
-predictions = torch.tensor([p[True] for p in predictions])
-predictions = torch.where(predictions >= c / (1 + c), 1, -1)
-
-print(
-    "Logistic Regression Loss:",
-    loss(test_set.targets, predictions, c=c),
-)
-
-# %%
-my_nn = mc.NormalizedStackedResNN(2, 104, 50).cuda()
-
-base_opt = optimizers.Adam
-opt = optimizers.SAM(my_nn.parameters(), base_opt, lr=0.001, maximize=True, rho=0.1)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt.base_optimizer, T_max=50)
-
-X_train_gpu = train_set.data.cuda()
-y_train_gpu = train_set.targets.cuda()
-n_train = X_train_gpu.shape[0]
-batch_size = 5000
+def objective_fn(inputs, labels):
+    return self_similarity_loss_linear(my_nn(inputs), labels, c=C) / len(labels) ** 2
 
 
 # %%
-epochs = 1000
-average_loss = 0.0
-
-for j in range(epochs):
-    idx = torch.randperm(n_train, device=X_train_gpu.device)[:batch_size]
-    inputs, labels = X_train_gpu[idx], y_train_gpu[idx]
-
-    features = my_nn(inputs)
-    objective = mc.self_similarity_loss_linear(features, labels, c=c) / (batch_size**2)
+for step in range(1, STEPS + 1):
+    opt.zero_grad()
+    objective = objective_fn(X_train, y_train)
     objective.backward()
-    opt.first_step(zero_grad=True)
+    opt.step()
 
-    features = my_nn(inputs)
-    objective = mc.self_similarity_loss_linear(features, labels, c=c) / (batch_size**2)
-    objective.backward()
-    opt.second_step(zero_grad=True)
-
-    average_loss = 0.9 * average_loss + 0.1 * objective.detach()
-
-    scheduler.step()
-
-    if (j + 1) % 50 == 0:
-        print(f"Epoch {j+1}: Loss: {average_loss:.6f}")
+    if step % 500 == 0:
+        print(f"Step {step}: Self-Similarity Score: {objective.item():.6f}")
 
 # %%
+with torch.inference_mode():
+    mean_weights = learn_mean_weights(my_nn(X_train), y_train, c=C)
+    predictions = mean_classifier(my_nn(X_test), mean_weights)
+    print("NN + Mean Loss:", loss(y_test, predictions, c=C))
+
+# %%
+# Logistic regression on the NN features (same settings as the baseline)
 with torch.no_grad():
-    X_train_nn = my_nn(train_set.data.cuda())
-    X_test_nn = my_nn(test_set.data.cuda())
+    Z_train = my_nn(X_train).cpu().numpy()
+    Z_test = my_nn(X_test).cpu().numpy()
 
-    mean_weights = mc.learn_mean_weights(X_train_nn, train_set.targets.cuda(), c=c)
-    predictions = mc.mean_classifier(X_test_nn, mean_weights).cpu()
-
-    print("NN + Mean Loss:", loss(test_set.targets, predictions, c=c))
+nn_log_reg = LogisticRegression(solver="liblinear", max_iter=10000)
+nn_log_reg.fit(Z_train, y_train_np)
+prob_pos = nn_log_reg.predict_proba(Z_test)[:, 1]  # P(y = +1)
+predictions = torch.as_tensor(np.where(prob_pos >= C / (1 + C), 1, -1), device=device)
+print("NN + Logistic Regression Loss:", loss(y_test, predictions, c=C))
 
 # %%
