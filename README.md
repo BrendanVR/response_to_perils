@@ -3,7 +3,7 @@
 This example predicts whether a person's income is above $50K using the
 [Adult dataset](https://www.openml.org/search?type=data&id=1590). It compares a
 simple mean classifier, with and without a learned neural network feature map,
-against logistic regression.
+against a linear support vector machine (SVM).
 
 ## Requirements
 
@@ -43,16 +43,16 @@ VS Code's interactive window (this also needs `pip install ipykernel`).
 2. **Constant classifier:** the better of always predicting `-1` or `+1`.
 3. **Mean classifier:** predicts the sign of the inner product between a sample
    and the mean of the label-weighted training features.
-4. **Logistic regression:** scikit-learn, `liblinear` solver, L2 penalty.
+4. **Linear SVM:** scikit-learn's `LinearSVC` with default regularisation.
 5. **Neural network features:** a two-block residual network with unit-norm
    output, trained with full-batch Adam to maximise the self-similarity score
 
-   `‖(1/N) Σ wᵢ f(xᵢ)‖²`
+   `‖(1/N) Σ yᵢ f(xᵢ)‖²`
 
-   where `wᵢ` is the label weight and `f` is the network. This equals the average
-   of `wᵢ wⱼ ⟨f(xᵢ), f(xⱼ)⟩` over all pairs, without building the N×N matrix.
-6. **Evaluation on learned features:** the mean classifier and logistic regression
-   are each applied to the network's output.
+   where `yᵢ` is the label and `f` is the network. This equals the average
+   of `yᵢ yⱼ ⟨f(xᵢ), f(xⱼ)⟩` over all pairs, without building the N×N matrix.
+6. **Evaluation on learned features:** the mean classifier and the linear SVM are
+   each applied to the network's output.
 
 ## Output
 
@@ -62,13 +62,12 @@ better) and a test loss for each classifier (lower is better):
 ```
 Constant Classifier Loss: ...
 Mean Loss: ...
-Logistic Regression Loss: ...
+SVM Loss: ...
 NN + Mean Loss: ...
-NN + Logistic Regression Loss: ...
+NN + SVM Loss: ...
 ```
 
-The loss is the cost-weighted error rate: `(false negatives + C × false positives) / N`,
-with `+1` as the positive class. With `C = 1` it is the ordinary error rate.
+The loss is the error rate: the fraction of test samples that are misclassified.
 
 ## Settings
 
@@ -77,13 +76,11 @@ Edit these at the top of the script:
 | Name | Meaning | Default |
 |---|---|---|
 | `SEED` | Seed for the data split and network initialisation | `42` |
-| `C` | Cost of a false positive relative to a false negative | `1.0` |
 | `STEPS` | Number of full-batch training steps | `5000` |
 | `TEST_SIZE` | Number of test samples | `16281` |
 
-`C` is not scikit-learn's regularisation parameter, which is also called `C` and is
-left at its default of 1. The network size and learning rate are set where the
-network and optimiser are created.
+The network size and learning rate are set where the network and optimiser are
+created.
 
 The split is random rather than the official UCI train/test split, so results are
 not directly comparable with published figures that use the official one.

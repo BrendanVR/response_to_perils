@@ -4,14 +4,13 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from sklearn.datasets import fetch_openml
-from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, normalize
+from sklearn.svm import LinearSVC
 from torch import nn
 
 # %%
 SEED = 42
-C = 1.0  # Cost parameter for false positives
 STEPS = 5000
 TEST_SIZE = 16281  # Size of the standard UCI Adult test split
 
@@ -21,11 +20,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # %%
-def loss(y_true, y_pred, c=1.0):
-    """Cost-weighted error rate for labels in {-1, 1}."""
-    false_neg = ((y_true == 1) & (y_pred == -1)).sum()
-    false_pos = ((y_true == -1) & (y_pred == 1)).sum()
-    return ((false_neg + c * false_pos) / y_true.numel()).item()
+def loss(y_true, y_pred):
+    """Error rate (fraction of misclassified samples)."""
+    return (y_true != y_pred).float().mean().item()
 
 
 def load_adult():
@@ -46,20 +43,24 @@ def load_adult():
 
 
 # %%
-def learn_mean_weights(X, y, c=1.0):
-    """Mean of the label-weighted feature vectors; negatives are weighted by c."""
-    weights = y if c == 1.0 else torch.where(y == -1, -c, 1.0)
-    return (X * weights.unsqueeze(1)).mean(0)
+def learn_mean_weights(X, y):
+    """Mean of the label-weighted feature vectors."""
+    return (X * y.unsqueeze(1)).mean(0)
 
 
 def mean_classifier(X, mean_weights):
-    return torch.sign(X @ mean_weights).to(torch.int64)
+    return torch.sign(X @ mean_weights)
 
 
-def self_similarity_loss_linear(x, labels, c=1.0):
-    # sum_ij w_i w_j <x_i, x_j> = ||sum_i w_i x_i||^2, avoiding the N x N matrix
-    weights = labels if c == 1.0 else torch.where(labels == -1, -c, 1.0)
-    return (weights @ x).square().sum()
+def self_similarity_loss_linear(x, labels):
+    # sum_ij y_i y_j <x_i, x_j> = ||sum_i y_i x_i||^2, avoiding the N x N matrix
+    return (labels @ x).square().sum()
+
+
+def linear_svm_loss(X_fit, X_eval):
+    """Fit a linear SVM on the training labels and return its test error rate."""
+    svm = LinearSVC(max_iter=10000).fit(X_fit, y_train_np)
+    return loss(y_test, torch.as_tensor(svm.predict(X_eval), device=device))
 
 
 class ResNN(nn.Module):
@@ -109,24 +110,17 @@ n_features = X_train.shape[1]
 
 # %%
 # Baseline constant classifier
-constant_loss = min(
-    loss(y_test, torch.full_like(y_test, label), c=C) for label in (-1, 1)
-)
+constant_loss = min(loss(y_test, torch.full_like(y_test, label)) for label in (-1, 1))
 print("Constant Classifier Loss:", constant_loss)
 
 # %%
 # Mean classifier
-mean_weights = learn_mean_weights(X_train, y_train, c=C)
-print("Mean Loss:", loss(y_test, mean_classifier(X_test, mean_weights), c=C))
+mean_weights = learn_mean_weights(X_train, y_train)
+print("Mean Loss:", loss(y_test, mean_classifier(X_test, mean_weights)))
 
 # %%
-# Logistic regression baseline (L2 penalty, C=1)
-# liblinear solver
-log_reg = LogisticRegression(solver="liblinear", max_iter=10000)
-log_reg.fit(X_train_np, y_train_np)
-prob_pos = log_reg.predict_proba(X_test_np)[:, 1]  # P(y = +1)
-predictions = torch.as_tensor(np.where(prob_pos >= C / (1 + C), 1, -1), device=device)
-print("Logistic Regression Loss:", loss(y_test, predictions, c=C))
+# Linear SVM baseline
+print("SVM Loss:", linear_svm_loss(X_train_np, X_test_np))
 
 # %%
 # Neural network feature map
@@ -138,7 +132,7 @@ opt = torch.optim.Adam(
 
 
 def objective_fn(inputs, labels):
-    return self_similarity_loss_linear(my_nn(inputs), labels, c=C) / len(labels) ** 2
+    return self_similarity_loss_linear(my_nn(inputs), labels) / len(labels) ** 2
 
 
 # %%
@@ -153,20 +147,16 @@ for step in range(1, STEPS + 1):
 
 # %%
 with torch.inference_mode():
-    mean_weights = learn_mean_weights(my_nn(X_train), y_train, c=C)
+    mean_weights = learn_mean_weights(my_nn(X_train), y_train)
     predictions = mean_classifier(my_nn(X_test), mean_weights)
-    print("NN + Mean Loss:", loss(y_test, predictions, c=C))
+    print("NN + Mean Loss:", loss(y_test, predictions))
 
 # %%
-# Logistic regression on the NN features (same settings as the baseline)
+# Linear SVM on the NN features
 with torch.no_grad():
     Z_train = my_nn(X_train).cpu().numpy()
     Z_test = my_nn(X_test).cpu().numpy()
 
-nn_log_reg = LogisticRegression(solver="liblinear", max_iter=10000)
-nn_log_reg.fit(Z_train, y_train_np)
-prob_pos = nn_log_reg.predict_proba(Z_test)[:, 1]  # P(y = +1)
-predictions = torch.as_tensor(np.where(prob_pos >= C / (1 + C), 1, -1), device=device)
-print("NN + Logistic Regression Loss:", loss(y_test, predictions, c=C))
+print("NN + SVM Loss:", linear_svm_loss(Z_train, Z_test))
 
 # %%
